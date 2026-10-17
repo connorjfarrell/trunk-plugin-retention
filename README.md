@@ -55,8 +55,9 @@ cargo build --release
 cargo test
 ```
 
-To try it on a recorder, add the executable as a plugin of your own (Plugins → Add a plugin, or
-`trunk-pro plugin add ./target/release/retention`).
+To try it on a recorder, add the executable as a plugin of your own on the Plugins page, then set
+its limits there. `trunk-pro plugin run` sends a plugin calls from disk, but this one watches no
+calls and its first pass is a minute after start, so it deletes nothing that way.
 
 ## License
 
