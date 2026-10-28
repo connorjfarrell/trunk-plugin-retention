@@ -15,18 +15,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sysinfo::Disks;
-use trunk_recorder_plugin::{Host, Manifest, NoConfig, Plugin, Setup, State};
+use trunk_recorder_plugin::{ConcludedCall, Host, Manifest, NoConfig, Plugin, Setup, State};
 
 /// Between passes.
 const EVERY: Duration = Duration::from_secs(600);
 /// Before the first pass after start.
 const FIRST: Duration = Duration::from_secs(60);
 /// A call changed this recently is never removed.
+/// A busy recorder wakes a pass after this many calls, but never sooner than `MIN_GAP` after the last.
+const WAKE_EVERY: u32 = 1000;
+const MIN_GAP: Duration = Duration::from_secs(60);
 const RECENT: Duration = Duration::from_secs(600);
 /// What a call's files end in; the rest of the name is the call's.
 const SUFFIXES: [&str; 5] = [".frames.jsonl", ".wav", ".m4a", ".json", ".sdr"];
@@ -291,8 +294,10 @@ fn disk_total(path: &Path) -> Option<u64> {
 }
 
 struct Retention {
-    /// Dropping it ends the worker.
+    /// A message wakes the worker for a pass; dropping it ends the worker.
     stop: Option<Sender<()>>,
+    /// Calls concluded since the worker was last woken.
+    concluded: u32,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -303,8 +308,9 @@ impl Plugin for Retention {
     fn manifest() -> Manifest {
         Manifest {
             name: "Retention".into(),
-            // It watches no events: it looks at the folder on a timer.
-            subscribe: vec![],
+            // It looks at the folder on a timer; a busy recorder also wakes it early,
+            // because the folder can grow faster than the timer notices.
+            subscribe: vec!["call.concluded".into()],
             // The id, version, description, … come from Cargo.toml.
             ..trunk_recorder_plugin::manifest!()
         }
@@ -331,13 +337,18 @@ impl Plugin for Retention {
         let worker = std::thread::Builder::new()
             .name("retention".into())
             .spawn(move || {
-                let mut wait = FIRST;
+                let mut next = Instant::now() + FIRST;
+                let mut earliest = next;
                 loop {
-                    match rx.recv_timeout(wait) {
+                    match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
                         Err(RecvTimeoutError::Timeout) => {}
-                        _ => return,
+                        // Woken by a busy recorder: only if a pass isn't just done.
+                        Ok(()) if Instant::now() >= earliest => {}
+                        Ok(()) => continue,
+                        Err(RecvTimeoutError::Disconnected) => return,
                     }
-                    wait = EVERY;
+                    next = Instant::now() + EVERY;
+                    earliest = Instant::now() + MIN_GAP;
                     if !cfg.active() {
                         continue;
                     }
@@ -366,7 +377,17 @@ impl Plugin for Retention {
                 }
             })
             .map_err(|e| format!("can't start the worker: {e}"))?;
-        Ok(Retention { stop: Some(stop), worker: Some(worker) })
+        Ok(Retention { stop: Some(stop), concluded: 0, worker: Some(worker) })
+    }
+
+    fn call_concluded(&mut self, _call: ConcludedCall) {
+        self.concluded += 1;
+        if self.concluded >= WAKE_EVERY {
+            self.concluded = 0;
+            if let Some(tx) = &self.stop {
+                let _ = tx.send(());
+            }
+        }
     }
 
     fn shutdown(&mut self, _grace: Duration) {
@@ -628,6 +649,11 @@ mod tests {
         assert!(c(0.0, f64::NAN, 0.0).check().is_err());
         assert!(c(0.0, 0.0, 96.0).check().is_err());
         assert!(c(0.0, 0.0, 0.5).check().is_err());
+    }
+
+    #[test]
+    fn it_subscribes_to_concluded_calls() {
+        assert_eq!(Retention::manifest().subscribe, vec!["call.concluded".to_string()]);
     }
 
     #[test]
