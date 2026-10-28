@@ -126,7 +126,8 @@ fn is_call_json(p: &Path) -> bool {
     if f.take(64 * 1024).read_to_string(&mut text).is_err() {
         return false;
     }
-    serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| ["talkgroup", "start_time", "call_length"].iter().all(|k| v.get(k).is_some_and(|x| x.is_number())))
+    serde_json::from_str::<serde_json::Value>(&text)
+        .is_ok_and(|v| ["talkgroup", "start_time", "call_length"].iter().all(|k| v.get(k).is_some_and(|x| x.is_number())))
 }
 
 /// The calls under `dir`, oldest first.
@@ -310,12 +311,24 @@ impl Plugin for Retention {
                     if !cfg.active() {
                         continue;
                     }
-                    let rep = pass(&dir, &cfg, disk_total(&dir), SystemTime::now());
+                    // (A panic in a pass is said, not the end of the worker with the plugin looking well.)
+                    let Ok(rep) = std::panic::catch_unwind(|| pass(&dir, &cfg, disk_total(&dir), SystemTime::now())) else {
+                        host.status(State::Error, "A pass failed unexpectedly; it will try again in ten minutes. See the log.");
+                        host.error("a pass panicked");
+                        continue;
+                    };
                     for f in &rep.failed {
                         host.warn(format!("couldn't delete {f}"));
                     }
                     if rep.files > 0 {
-                        let line = format!("deleted {} call(s), {} file(s), {:.1} MB from {} ({})", rep.calls, rep.files, rep.bytes as f64 / 1e6, dir.display(), rep.why.join(", "));
+                        let line = format!(
+                            "deleted {} call(s), {} file(s), {:.1} MB from {} ({})",
+                            rep.calls,
+                            rep.files,
+                            rep.bytes as f64 / 1e6,
+                            dir.display(),
+                            rep.why.join(", ")
+                        );
                         host.info(line.clone());
                         host.status(State::Ok, format!("keeping {}. Last pass: {line}", describe(&cfg)));
                     }
@@ -481,7 +494,9 @@ mod tests {
         let call_json = br#"{"talkgroup":5,"start_time":1,"call_length":3,"freq":851000000}"#;
         // A custom-named call, known by its JSON; stray files with call-like endings.
         fs::create_dir_all(&root).unwrap();
-        for (n, body) in [("kcpd-dispatch.json", &call_json[..]), ("kcpd-dispatch.wav", b"x"), ("notes.json", br#"{"a":1}"#), ("audio.wav", b"x"), ("list.json", b"[1,2]")] {
+        for (n, body) in
+            [("kcpd-dispatch.json", &call_json[..]), ("kcpd-dispatch.wav", b"x"), ("notes.json", br#"{"a":1}"#), ("audio.wav", b"x"), ("list.json", b"[1,2]")]
+        {
             fs::write(root.join(n), body).unwrap();
             set_age(&root.join(n), now, 24 * 90);
         }
@@ -492,6 +507,26 @@ mod tests {
             assert!(root.join(keep).exists(), "{keep}");
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_are_not_followed() {
+        let root = std::env::temp_dir().join(format!("retention-links-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("retention-outside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        let now = SystemTime::now();
+        write(&outside.join("5-100_851.0.wav"), 10);
+        set_age(&outside.join("5-100_851.0.wav"), now, 24 * 90);
+        fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(outside.join("5-100_851.0.wav"), root.join("5-200_851.0.wav")).unwrap();
+        let rep = pass(&root, &limits(30.0, 0.0, 0.0), None, now);
+        assert_eq!((rep.calls, rep.files), (0, 0));
+        assert!(outside.join("5-100_851.0.wav").exists(), "a call outside the folder, reached through a link, stays");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
