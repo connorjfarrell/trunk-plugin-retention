@@ -43,8 +43,8 @@ disk's size isn't known, and is then skipped.
 - The size limits count call files only, not other data on the disk, and are met to the minute: up
   to a minute of calls more than needed can go.
 - A pass walks the folder twice, a folder at a time (to find where the limit falls, then to delete),
-  so its memory does not grow with the number of calls: on 400,000 calls (about 35 GB, 15 days) it
-  took under a minute and held about 10 MB.
+  so its memory does not grow with the number of calls. (A dry run over about 35 GB of recordings
+  finished within a minute and the plugin stood at under 10 MB afterwards; I didn't measure its peak.)
 - It deletes from the recordings folder the recorder was started with. A change to `captureDir`
   applies at the next Start. Each pass that deletes anything says so in the plugin's log.
 - The recorder's call list still shows calls the plugin deleted, and can't play them.
