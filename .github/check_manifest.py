@@ -5,7 +5,7 @@ check_manifest.py manifest.json [--release]
 """
 import json, re, sys
 
-m = json.load(open(sys.argv[1]))
+m = json.load(open(sys.argv[1], encoding="utf-8"))
 release = "--release" in sys.argv
 problems = []
 if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,40}", m.get("id", "")):

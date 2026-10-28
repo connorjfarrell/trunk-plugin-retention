@@ -46,7 +46,7 @@ struct Config {
     max_age_days: f64,
     /// Keep at most, GB
     ///
-    /// The oldest calls go first (a gigabyte is 10⁹ bytes). 0: no limit.
+    /// The oldest calls go first (a gigabyte is 1,000,000,000 bytes). 0: no limit.
     max_size_gb: f64,
     /// Keep at most, % of the disk
     ///
