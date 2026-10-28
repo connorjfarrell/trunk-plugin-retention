@@ -16,6 +16,7 @@ Each limit is off at `0`. Any that are set apply together.
 | Keep calls for, days | `maxAgeDays` | Calls older than this are deleted |
 | Keep at most, GB | `maxSizeGb` | The oldest calls go while the folder holds more than this (a gigabyte is 10⁹ bytes) |
 | Keep at most, % of the disk | `maxDiskPct` | The same, as a share of the disk's capacity (not of what is free), from 1 to 95 |
+| Dry run | `dryRun` | Say in the log what a pass would delete, and delete nothing |
 
 If a size and a share are both set, the smaller limit wins. A share can't be worked out when the
 disk's size isn't known, and is then skipped.
@@ -39,13 +40,22 @@ disk's size isn't known, and is then skipped.
   for an upload plugin.
 - A call's age is when its newest file last changed. It goes by file time, so files copied without
   keeping their times look new. A file whose time can't be read counts as just written.
-- The size limits count call files only, not other data on the disk.
+- The size limits count call files only, not other data on the disk, and are met to the minute: up
+  to a minute of calls more than needed can go.
+- A pass walks the folder twice, a folder at a time (to find where the limit falls, then to delete),
+  so its memory does not grow with the number of calls: on 400,000 calls (about 35 GB, 15 days) it
+  took under a minute and held about 10 MB.
 - It deletes from the recordings folder the recorder was started with. A change to `captureDir`
   applies at the next Start. Each pass that deletes anything says so in the plugin's log.
 - The recorder's call list still shows calls the plugin deleted, and can't play them.
 
-**It deletes files. Try it on a copy of your recordings first**, with a limit that removes only a
-few calls, before you set one you mean to keep.
+**It deletes files.** When you set or change a limit, turn on **Dry run** first: the first pass
+says in the log how many calls and how many megabytes it would delete, and deletes nothing. Look
+at that, then turn Dry run off.
+
+Calls an upload plugin is still retrying are not known to it: with a short age limit, or a size
+limit the folder is already well over, it can delete the files of a call an uploader has queued.
+Keep calls for days, not hours, if your uploaders can be down for a while.
 
 ## Build
 

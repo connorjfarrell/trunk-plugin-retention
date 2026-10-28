@@ -10,7 +10,7 @@
 //! A call changed in the last [`RECENT`] may still be recording, or waiting for
 //! a plugin, and stays. Folders left empty go, the recordings folder itself not.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -49,11 +49,15 @@ struct Config {
     ///
     /// Of the disk the recordings folder is on, from 1 to 95; the oldest calls go first. If a size is set too, the smaller limit wins. 0: no limit.
     max_disk_pct: f64,
+    /// Dry run
+    ///
+    /// Say in the log what a pass would delete, and delete nothing. Turn it on when you set or change a limit, look at what it says, then turn it off.
+    dry_run: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { max_age_days: 0.0, max_size_gb: 0.0, max_disk_pct: 0.0 }
+        Config { max_age_days: 0.0, max_size_gb: 0.0, max_disk_pct: 0.0, dry_run: false }
     }
 }
 
@@ -96,7 +100,7 @@ struct Call {
     bytes: u64,
 }
 
-/// What a pass found and did.
+/// What a pass found and did (or, in a dry run, would do).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Report {
     calls: usize,
@@ -106,6 +110,24 @@ struct Report {
     why: Vec<&'static str>,
     /// Files that couldn't be deleted, as the log tells it.
     failed: Vec<String>,
+}
+
+/// The limits of a pass, in the terms it works in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Limits {
+    age: Option<Duration>,
+    /// The size the folder may be, bytes: the smaller of the size and the share of the disk.
+    bytes: Option<u64>,
+}
+
+impl Limits {
+    fn new(r: &Config, disk_total: Option<u64>) -> Limits {
+        // (A limit too big to be a Duration is no limit.)
+        let age = r.age_limit_days().and_then(|d| Duration::try_from_secs_f64(d * 86_400.0).ok());
+        let gb = r.size_limit_gb().map(|g| (g * GB) as u64);
+        let pct = r.disk_limit_pct().and_then(|p| disk_total.filter(|&t| t > 0).map(|t| (t as f64 * p / 100.0) as u64));
+        Limits { age, bytes: gb.into_iter().chain(pct).min() }
+    }
 }
 
 /// Whether `stem` is the recorder's own name for a call: `<talkgroup>-<start>_<freq>`,
@@ -130,104 +152,98 @@ fn is_call_json(p: &Path) -> bool {
         .is_ok_and(|v| ["talkgroup", "start_time", "call_length"].iter().all(|k| v.get(k).is_some_and(|x| x.is_number())))
 }
 
-/// The calls under `dir`, oldest first.
-fn scan(dir: &Path) -> Vec<Call> {
-    let mut by_call: HashMap<String, Call> = HashMap::new();
+/// Hands each call under `dir` to `f`, a folder at a time: only one folder's files are held, so a
+/// recordings folder of millions of calls costs no more memory than its busiest day.
+fn walk(dir: &Path, mut f: impl FnMut(Call)) {
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = fs::read_dir(&d) else { continue };
+        let mut by_call: HashMap<String, Call> = HashMap::new();
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {
                 continue;
             }
+            // (`DirEntry::metadata` doesn't follow a link: a link is neither a folder nor a file here.)
             let Ok(m) = e.metadata() else { continue };
             let p = e.path();
             if m.is_dir() {
                 stack.push(p);
             } else if m.is_file() {
                 let Some(stem) = SUFFIXES.iter().find_map(|s| name.strip_suffix(s)) else { continue };
-                let key = d.join(stem).display().to_string();
                 // (A file with no time is taken as just written: it stays.)
                 let t = m.modified().unwrap_or_else(|_| SystemTime::now());
-                let c = by_call.entry(key).or_insert_with(|| Call { files: Vec::new(), newest: SystemTime::UNIX_EPOCH, bytes: 0 });
+                let c = by_call.entry(stem.to_string()).or_insert_with(|| Call { files: Vec::new(), newest: SystemTime::UNIX_EPOCH, bytes: 0 });
                 c.files.push((p, m.len()));
                 c.newest = c.newest.max(t);
                 c.bytes += m.len();
             }
         }
-    }
-    // Files that merely end like a call's aren't one.
-    let mut calls: Vec<Call> = by_call
-        .into_iter()
-        .filter(|(key, c)| {
-            let stem = Path::new(key).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            is_call_name(&stem) || c.files.iter().any(|(p, _)| p.extension().is_some_and(|e| e == "json") && is_call_json(p))
-        })
-        .map(|(_, c)| c)
-        .collect();
-    calls.sort_by_key(|c| c.newest);
-    calls
-}
-
-/// The size the folder may be, bytes: the smaller of the two limits set.
-fn size_limit(r: &Config, disk_total: Option<u64>) -> Option<u64> {
-    let gb = r.size_limit_gb().map(|g| (g * GB) as u64);
-    let pct = r.disk_limit_pct().and_then(|p| disk_total.filter(|&t| t > 0).map(|t| (t as f64 * p / 100.0) as u64));
-    gb.into_iter().chain(pct).min()
-}
-
-/// Which of `calls` (oldest first) to delete at `now`: the indexes, and why.
-fn plan(calls: &[Call], r: &Config, disk_total: Option<u64>, now: SystemTime) -> (Vec<usize>, Vec<&'static str>) {
-    let mut gone = vec![false; calls.len()];
-    let mut why = Vec::new();
-    // Oldest first, so what follows the first call too recent to remove is too.
-    let removable = |c: &Call| now.duration_since(c.newest).is_ok_and(|d| d >= RECENT);
-    if let Some(days) = r.age_limit_days() {
-        // (A limit too big to be a Duration is no limit.)
-        let age = Duration::try_from_secs_f64(days * 86_400.0).unwrap_or(Duration::MAX);
-        for (i, c) in calls.iter().enumerate() {
-            if removable(c) && now.duration_since(c.newest).is_ok_and(|d| d > age) {
-                gone[i] = true;
+        for (stem, c) in by_call {
+            // Files that merely end like a call's aren't one.
+            if is_call_name(&stem) || c.files.iter().any(|(p, _)| p.extension().is_some_and(|e| e == "json") && is_call_json(p)) {
+                f(c);
             }
         }
-        if gone.iter().any(|&g| g) {
-            why.push("older than the age limit");
-        }
     }
-    if let Some(limit) = size_limit(r, disk_total) {
-        let mut total: u64 = calls.iter().zip(&gone).filter(|(_, g)| !**g).map(|(c, _)| c.bytes).sum();
-        let mut cut = false;
-        for (i, c) in calls.iter().enumerate() {
+}
+
+fn secs(t: SystemTime) -> i64 {
+    t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// The time before which calls go, as Unix seconds, and the sizes behind it: calls whose newest file
+/// is older than this are deleted. `sizes` is the bytes of calls by the minute they last changed.
+/// (A size limit is met to the minute: up to a minute more than needed may go.)
+fn cutoff(sizes: &BTreeMap<i64, u64>, limits: &Limits, now: SystemTime) -> (i64, i64) {
+    let now_s = secs(now);
+    // Never a call changed in the last [`RECENT`].
+    let newest_allowed = now_s - RECENT.as_secs() as i64;
+    let age_cut = limits.age.map_or(i64::MIN, |a| now_s.saturating_sub(a.as_secs().min(i64::MAX as u64) as i64));
+    let mut size_cut = i64::MIN;
+    if let Some(limit) = limits.bytes {
+        // What the folder holds once the old ones are gone.
+        let mut total: u64 = sizes.iter().filter(|(m, _)| (**m + 1) * 60 > age_cut).map(|(_, b)| b).sum();
+        for (m, bytes) in sizes {
             if total <= limit {
                 break;
             }
-            if gone[i] {
+            if (m + 1) * 60 <= age_cut {
                 continue;
             }
-            if !removable(c) {
-                break;
-            }
-            gone[i] = true;
-            total -= c.bytes;
-            cut = true;
-        }
-        if cut {
-            why.push("over the size limit");
+            total -= bytes;
+            size_cut = (m + 1) * 60;
         }
     }
-    ((0..calls.len()).filter(|&i| gone[i]).collect(), why)
+    (age_cut.min(newest_allowed), size_cut.min(newest_allowed))
 }
 
-/// One pass over `dir`.
-fn pass(dir: &Path, r: &Config, disk_total: Option<u64>, now: SystemTime) -> Report {
-    let calls = scan(dir);
-    let (doomed, why) = plan(&calls, r, disk_total, now);
-    let mut rep = Report { why, ..Default::default() };
+/// One pass over `dir`: a walk to total the calls by the minute they last changed, which says where
+/// the line is, and a second walk to delete the calls before it. With `dry_run`, nothing is deleted
+/// and the report is what would be.
+fn pass(dir: &Path, limits: &Limits, now: SystemTime, dry_run: bool) -> Report {
+    let mut rep = Report::default();
+    if limits.age.is_none() && limits.bytes.is_none() {
+        return rep;
+    }
+    let mut sizes: BTreeMap<i64, u64> = BTreeMap::new();
+    walk(dir, |c| *sizes.entry(secs(c.newest).div_euclid(60)).or_default() += c.bytes);
+    let (age_cut, size_cut) = cutoff(&sizes, limits, now);
+    let (mut by_age, mut by_size) = (false, false);
     let mut parents = std::collections::BTreeSet::new();
-    for i in doomed {
+    walk(dir, |c| {
+        let t = secs(c.newest);
+        if t >= age_cut && t >= size_cut {
+            return;
+        }
         let mut removed = 0;
-        for (p, len) in &calls[i].files {
+        for (p, len) in &c.files {
+            if dry_run {
+                rep.files += 1;
+                rep.bytes += len;
+                removed += 1;
+                continue;
+            }
             match fs::remove_file(p) {
                 Ok(()) => {
                     rep.files += 1;
@@ -241,7 +257,20 @@ fn pass(dir: &Path, r: &Config, disk_total: Option<u64>, now: SystemTime) -> Rep
                 Err(e) => rep.failed.push(format!("{}: {e}", p.display())),
             }
         }
-        rep.calls += usize::from(removed > 0);
+        if removed > 0 {
+            rep.calls += 1;
+            if t < age_cut {
+                by_age = true;
+            } else {
+                by_size = true;
+            }
+        }
+    });
+    if by_age {
+        rep.why.push("older than the age limit");
+    }
+    if by_size {
+        rep.why.push("over the size limit");
     }
     // Folders that emptied, deepest first, up to (not including) `dir`.
     let mut dirs: Vec<PathBuf> = parents.into_iter().flat_map(|p| p.ancestors().take_while(|a| *a != dir).map(Path::to_path_buf).collect::<Vec<_>>()).collect();
@@ -293,7 +322,8 @@ impl Plugin for Retention {
             return Err(format!("the recordings folder {} doesn't exist", dir.display()));
         }
         if cfg.active() {
-            host.status(State::Ok, format!("keeping {} — first pass in a minute", describe(&cfg)));
+            let how = if cfg.dry_run { "dry run (nothing is deleted)" } else { "keeping" };
+            host.status(State::Ok, format!("{how} {} — first pass in a minute", describe(&cfg)));
         } else {
             host.status(State::Warning, "No limit is set, so nothing is deleted. Set one in this plugin's settings.");
         }
@@ -312,7 +342,7 @@ impl Plugin for Retention {
                         continue;
                     }
                     // (A panic in a pass is said, not the end of the worker with the plugin looking well.)
-                    let Ok(rep) = std::panic::catch_unwind(|| pass(&dir, &cfg, disk_total(&dir), SystemTime::now())) else {
+                    let Ok(rep) = std::panic::catch_unwind(|| pass(&dir, &Limits::new(&cfg, disk_total(&dir)), SystemTime::now(), cfg.dry_run)) else {
                         host.status(State::Error, "A pass failed unexpectedly; it will try again in ten minutes. See the log.");
                         host.error("a pass panicked");
                         continue;
@@ -322,7 +352,8 @@ impl Plugin for Retention {
                     }
                     if rep.files > 0 {
                         let line = format!(
-                            "deleted {} call(s), {} file(s), {:.1} MB from {} ({})",
+                            "{} {} call(s), {} file(s), {:.1} MB from {} ({})",
+                            if cfg.dry_run { "dry run: would delete" } else { "deleted" },
                             rep.calls,
                             rep.files,
                             rep.bytes as f64 / 1e6,
@@ -371,73 +402,8 @@ mod tests {
     use serde_json::json;
     use trunk_recorder_plugin::{HostMessage, testing};
 
-    fn call(age_h: u64, bytes: u64, now: SystemTime) -> Call {
-        Call { files: vec![(PathBuf::from(format!("/x/{age_h}-{bytes}.wav")), bytes)], newest: now - Duration::from_secs(age_h * 3600), bytes }
-    }
-
-    fn limits(days: f64, gb: f64, pct: f64) -> Config {
-        Config { max_age_days: days, max_size_gb: gb, max_disk_pct: pct }
-    }
-
-    #[test]
-    fn nothing_is_removed_with_no_limit() {
-        let now = SystemTime::now();
-        let calls = vec![call(5000, 10, now), call(1, 10, now)];
-        assert_eq!(plan(&calls, &limits(0.0, 0.0, 0.0), None, now).0, Vec::<usize>::new());
-    }
-
-    #[test]
-    fn age_removes_calls_older_than_the_limit() {
-        let now = SystemTime::now();
-        let calls = vec![call(80, 1, now), call(50, 1, now), call(20, 1, now)];
-        let (gone, why) = plan(&calls, &limits(2.0, 0.0, 0.0), None, now);
-        assert_eq!(gone, [0, 1]);
-        assert_eq!(why, ["older than the age limit"]);
-    }
-
-    #[test]
-    fn size_removes_the_oldest_until_it_fits() {
-        let now = SystemTime::now();
-        let gb = GB as u64;
-        let calls = vec![call(30, gb, now), call(20, gb, now), call(10, gb, now), call(5, gb, now)];
-        let (gone, why) = plan(&calls, &limits(0.0, 2.5, 0.0), None, now);
-        assert_eq!(gone, [0, 1], "4 GB down to 2");
-        assert_eq!(why, ["over the size limit"]);
-        assert!(plan(&calls, &limits(0.0, 4.0, 0.0), None, now).0.is_empty(), "exactly at the limit is fine");
-    }
-
-    #[test]
-    fn the_share_of_the_disk_and_the_size_limit_apply_together() {
-        let now = SystemTime::now();
-        let gb = GB as u64;
-        let calls = vec![call(30, gb, now), call(20, gb, now), call(10, gb, now), call(5, gb, now)];
-        // 10% of a 20 GB disk is 2 GB; the size limit says 3.
-        assert_eq!(plan(&calls, &limits(0.0, 3.0, 10.0), Some(20 * gb), now).0, [0, 1]);
-        // 50% of it is 10 GB; the size limit says 3.
-        assert_eq!(plan(&calls, &limits(0.0, 3.0, 50.0), Some(20 * gb), now).0, [0]);
-        // A share of a disk of unknown size does nothing.
-        assert!(plan(&calls, &limits(0.0, 0.0, 10.0), None, now).0.is_empty());
-    }
-
-    #[test]
-    fn age_and_size_together_count_only_what_is_left() {
-        let now = SystemTime::now();
-        let gb = GB as u64;
-        // Age removes the first; the remaining 2 GB fit in 2.5.
-        let calls = vec![call(80, gb, now), call(10, gb, now), call(5, gb, now)];
-        assert_eq!(plan(&calls, &limits(2.0, 2.5, 0.0), None, now).0, [0]);
-    }
-
-    #[test]
-    fn a_recent_call_is_never_removed() {
-        let now = SystemTime::now();
-        let gb = GB as u64;
-        let mut calls = vec![call(5, gb, now), call(0, gb, now)];
-        calls[1].newest = now - Duration::from_secs(30);
-        let (gone, _) = plan(&calls, &limits(0.0, 0.5, 0.0), None, now);
-        assert_eq!(gone, [0], "the one 30 s old stays, though the folder is still over");
-        let (gone, _) = plan(&calls, &limits(0.000001, 0.0, 0.0), None, now);
-        assert_eq!(gone, [0]);
+    fn limits(days: f64, bytes: u64) -> Limits {
+        Limits { age: (days > 0.0).then(|| Duration::from_secs_f64(days * 86_400.0)), bytes: (bytes > 0).then_some(bytes) }
     }
 
     fn write(p: &Path, n: usize) {
@@ -450,24 +416,126 @@ mod tests {
         f.set_modified(now - Duration::from_secs(hours * 3600)).unwrap();
     }
 
+    fn root(name: &str) -> PathBuf {
+        let r = std::env::temp_dir().join(format!("retention-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&r);
+        fs::create_dir_all(&r).unwrap();
+        r
+    }
+
+    /// A call of `bytes`, last changed `age_h` hours ago, in `d` (a `.wav` and a `.json`).
+    fn call(d: &Path, tg: u32, age_h: u64, bytes: usize, now: SystemTime) {
+        for (ext, n) in [("wav", bytes - 10), ("json", 10)] {
+            let p = d.join(format!("{tg}-{}_851.0.{ext}", age_h + 1_000_000));
+            write(&p, n);
+            set_age(&p, now, age_h);
+        }
+    }
+
+    fn left(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> =
+            fs::read_dir(d).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".wav")).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn nothing_is_removed_with_no_limit() {
+        let (r, now) = (root("none"), SystemTime::now());
+        call(&r, 5, 5000, 100, now);
+        let rep = pass(&r, &limits(0.0, 0), now, false);
+        assert_eq!((rep.calls, rep.files), (0, 0));
+        assert_eq!(left(&r).len(), 1);
+    }
+
+    #[test]
+    fn age_removes_calls_older_than_the_limit() {
+        let (r, now) = (root("age"), SystemTime::now());
+        for (tg, age_h) in [(1, 80 * 24), (2, 50 * 24), (3, 20 * 24)] {
+            call(&r, tg, age_h, 100, now);
+        }
+        let rep = pass(&r, &limits(30.0, 0), now, false);
+        assert_eq!((rep.calls, rep.files, rep.bytes), (2, 4, 200));
+        assert_eq!(rep.why, ["older than the age limit"]);
+        assert_eq!(left(&r).len(), 1, "{:?}", left(&r));
+    }
+
+    #[test]
+    fn size_removes_the_oldest_until_it_fits() {
+        let (r, now) = (root("size"), SystemTime::now());
+        for (tg, age_h) in [(1, 30), (2, 20), (3, 10), (4, 5)] {
+            call(&r, tg, age_h, 100, now);
+        }
+        // 400 bytes down to 250: the oldest two go (the next would be 300: still over by 50).
+        let rep = pass(&r, &limits(0.0, 250), now, false);
+        assert_eq!(rep.calls, 2, "{rep:?}");
+        assert_eq!(rep.why, ["over the size limit"]);
+        assert_eq!(left(&r), ["3-1000010_851.0.wav", "4-1000005_851.0.wav"]);
+        // Exactly at the limit is fine.
+        let rep = pass(&r, &limits(0.0, 200), now, false);
+        assert_eq!(rep.calls, 0);
+    }
+
+    #[test]
+    fn the_smaller_of_the_size_and_the_share_of_the_disk() {
+        let cfg = |gb, pct| Config { max_size_gb: gb, max_disk_pct: pct, ..Default::default() };
+        let gb = GB as u64;
+        // 10% of a 20 GB disk is 2 GB; the size limit says 3.
+        assert_eq!(Limits::new(&cfg(3.0, 10.0), Some(20 * gb)).bytes, Some(2 * gb));
+        // 50% of it is 10 GB; the size limit says 3.
+        assert_eq!(Limits::new(&cfg(3.0, 50.0), Some(20 * gb)).bytes, Some(3 * gb));
+        // A share of a disk of unknown size does nothing.
+        assert_eq!(Limits::new(&cfg(0.0, 10.0), None).bytes, None);
+        // An age too big to be a duration is no limit.
+        assert_eq!(Limits::new(&Config { max_age_days: 1e308, ..Default::default() }, None).age, None);
+    }
+
+    #[test]
+    fn age_and_size_together_count_only_what_is_left() {
+        let (r, now) = (root("both"), SystemTime::now());
+        for (tg, age_h) in [(1, 80 * 24), (2, 10), (3, 5)] {
+            call(&r, tg, age_h, 100, now);
+        }
+        // Age removes the first; the remaining 200 bytes fit in 250.
+        let rep = pass(&r, &limits(2.0, 250), now, false);
+        assert_eq!(rep.calls, 1, "{rep:?}");
+        assert_eq!(left(&r).len(), 2);
+    }
+
+    #[test]
+    fn a_recent_call_is_never_removed() {
+        let (r, now) = (root("recent"), SystemTime::now());
+        call(&r, 1, 5, 100, now);
+        // One 30 seconds old: though the folder is still over, it stays.
+        let p = r.join("2-1000000_851.0.wav");
+        write(&p, 100);
+        let f = fs::File::options().write(true).open(&p).unwrap();
+        f.set_modified(now - Duration::from_secs(30)).unwrap();
+        let rep = pass(&r, &limits(0.0, 50), now, false);
+        assert_eq!(rep.calls, 1);
+        assert_eq!(left(&r), ["2-1000000_851.0.wav"]);
+        let rep = pass(&r, &limits(0.000001, 0), now, false);
+        assert_eq!(rep.calls, 0, "an age of a second removes nothing that is 30 seconds old");
+    }
+
     #[test]
     fn a_pass_deletes_whole_calls_and_only_calls() {
-        let root = std::env::temp_dir().join(format!("retention-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let now = SystemTime::now();
-        let old = root.join("a/2026/01/01");
-        let new = root.join("a/2026/10/13");
+        let (r, now) = (root("whole"), SystemTime::now());
+        let old = r.join("a/2026/01/01");
+        let new = r.join("a/2026/10/13");
         for ext in ["wav", "json", "m4a", "frames.jsonl", "sdr"] {
-            write(&old.join(format!("5-100_851.0.{ext}")), 10);
-            set_age(&old.join(format!("5-100_851.0.{ext}")), now, 24 * 60);
+            let p = old.join(format!("5-100_851.0.{ext}"));
+            write(&p, 10);
+            set_age(&p, now, 24 * 60);
         }
         write(&old.join("notes.txt"), 10);
         set_age(&old.join("notes.txt"), now, 24 * 60);
-        write(&new.join("5-200_851.0.wav"), 10);
-        write(&new.join("5-200_851.0.json"), 10);
-        set_age(&new.join("5-200_851.0.wav"), now, 2);
-        set_age(&new.join("5-200_851.0.json"), now, 2);
-        let rep = pass(&root, &limits(30.0, 0.0, 0.0), None, now);
+        for ext in ["wav", "json"] {
+            let p = new.join(format!("5-200_851.0.{ext}"));
+            write(&p, 10);
+            set_age(&p, now, 2);
+        }
+        let rep = pass(&r, &limits(30.0, 0), now, false);
         assert_eq!((rep.calls, rep.files, rep.bytes), (1, 5, 50));
         assert!(old.join("notes.txt").exists(), "other files stay, and so does their folder");
         assert!(!old.join("5-100_851.0.wav").exists() && !old.join("5-100_851.0.json").exists());
@@ -476,10 +544,9 @@ mod tests {
         fs::remove_file(old.join("notes.txt")).unwrap();
         write(&old.join("5-100_851.0.wav"), 10);
         set_age(&old.join("5-100_851.0.wav"), now, 24 * 60);
-        pass(&root, &limits(30.0, 0.0, 0.0), None, now);
-        assert!(!root.join("a/2026/01").exists(), "emptied folders go");
-        assert!(root.exists() && new.exists(), "the recordings folder and busy ones stay");
-        let _ = fs::remove_dir_all(&root);
+        pass(&r, &limits(30.0, 0), now, false);
+        assert!(!r.join("a/2026/01").exists(), "emptied folders go");
+        assert!(r.exists() && new.exists(), "the recordings folder and busy ones stay");
     }
 
     #[test]
@@ -488,62 +555,79 @@ mod tests {
         for no in ["notes", "audio", "5-1791952226", "-1_2", "a-1_2", "5-1_", "5-1_2.x", "5-1_2."] {
             assert!(!is_call_name(no), "{no}");
         }
-        let root = std::env::temp_dir().join(format!("retention-id-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let now = SystemTime::now();
+        let (r, now) = (root("id"), SystemTime::now());
         let call_json = br#"{"talkgroup":5,"start_time":1,"call_length":3,"freq":851000000}"#;
         // A custom-named call, known by its JSON; stray files with call-like endings.
-        fs::create_dir_all(&root).unwrap();
         for (n, body) in
             [("kcpd-dispatch.json", &call_json[..]), ("kcpd-dispatch.wav", b"x"), ("notes.json", br#"{"a":1}"#), ("audio.wav", b"x"), ("list.json", b"[1,2]")]
         {
-            fs::write(root.join(n), body).unwrap();
-            set_age(&root.join(n), now, 24 * 90);
+            fs::write(r.join(n), body).unwrap();
+            set_age(&r.join(n), now, 24 * 90);
         }
-        let rep = pass(&root, &limits(30.0, 0.0, 0.0), None, now);
+        let rep = pass(&r, &limits(30.0, 0), now, false);
         assert_eq!((rep.calls, rep.files), (1, 2));
-        assert!(!root.join("kcpd-dispatch.wav").exists() && !root.join("kcpd-dispatch.json").exists());
+        assert!(!r.join("kcpd-dispatch.wav").exists() && !r.join("kcpd-dispatch.json").exists());
         for keep in ["notes.json", "audio.wav", "list.json"] {
-            assert!(root.join(keep).exists(), "{keep}");
+            assert!(r.join(keep).exists(), "{keep}");
         }
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
     #[test]
     fn links_are_not_followed() {
-        let root = std::env::temp_dir().join(format!("retention-links-{}", std::process::id()));
-        let outside = std::env::temp_dir().join(format!("retention-outside-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside);
-        let now = SystemTime::now();
+        let (r, outside, now) = (root("links"), root("links-outside"), SystemTime::now());
         write(&outside.join("5-100_851.0.wav"), 10);
         set_age(&outside.join("5-100_851.0.wav"), now, 24 * 90);
-        fs::create_dir_all(&root).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("elsewhere")).unwrap();
-        std::os::unix::fs::symlink(outside.join("5-100_851.0.wav"), root.join("5-200_851.0.wav")).unwrap();
-        let rep = pass(&root, &limits(30.0, 0.0, 0.0), None, now);
+        std::os::unix::fs::symlink(&outside, r.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(outside.join("5-100_851.0.wav"), r.join("5-200_851.0.wav")).unwrap();
+        let rep = pass(&r, &limits(30.0, 0), now, false);
         assert_eq!((rep.calls, rep.files), (0, 0));
         assert!(outside.join("5-100_851.0.wav").exists(), "a call outside the folder, reached through a link, stays");
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
-    fn an_age_too_big_to_be_a_duration_is_no_limit() {
-        let now = SystemTime::now();
-        let calls = vec![call(5000, 1, now)];
-        assert!(plan(&calls, &limits(1e308, 0.0, 0.0), None, now).0.is_empty());
+    fn a_dry_run_deletes_nothing_and_says_what_would_go() {
+        let (r, now) = (root("dry"), SystemTime::now());
+        call(&r, 1, 80 * 24, 100, now);
+        call(&r, 2, 1, 100, now);
+        let rep = pass(&r, &limits(30.0, 0), now, true);
+        assert_eq!((rep.calls, rep.files, rep.bytes), (1, 2, 100));
+        assert_eq!(left(&r).len(), 2, "both are still there");
+        let rep = pass(&r, &limits(30.0, 0), now, false);
+        assert_eq!((rep.calls, rep.files), (1, 2));
+        assert_eq!(left(&r).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_deleted_is_reported_and_the_rest_go_on() {
+        use std::os::unix::fs::PermissionsExt;
+        let (r, now) = (root("failed"), SystemTime::now());
+        let stuck = r.join("stuck");
+        call(&stuck, 1, 80 * 24, 100, now);
+        call(&r, 2, 80 * 24, 100, now);
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o555)).unwrap();
+        // (A user who can write there anyway, root, has nothing to test.)
+        if fs::File::create(stuck.join("probe")).is_ok() {
+            fs::set_permissions(&stuck, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let rep = pass(&r, &limits(30.0, 0), now, false);
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(rep.failed.len(), 2, "{rep:?}");
+        assert_eq!((rep.calls, rep.files), (1, 2), "the other call went");
+        assert_eq!(left(&stuck).len(), 1);
     }
 
     #[test]
     fn settings_are_checked() {
-        assert!(limits(0.0, 0.0, 0.0).check().is_ok());
-        assert!(limits(90.0, 0.0, 80.0).check().is_ok());
-        assert!(limits(-1.0, 0.0, 0.0).check().is_err());
-        assert!(limits(0.0, f64::NAN, 0.0).check().is_err());
-        assert!(limits(0.0, 0.0, 96.0).check().is_err());
-        assert!(limits(0.0, 0.0, 0.5).check().is_err());
+        let c = |d, g, p| Config { max_age_days: d, max_size_gb: g, max_disk_pct: p, dry_run: false };
+        assert!(c(0.0, 0.0, 0.0).check().is_ok());
+        assert!(c(90.0, 0.0, 80.0).check().is_ok());
+        assert!(c(-1.0, 0.0, 0.0).check().is_err());
+        assert!(c(0.0, f64::NAN, 0.0).check().is_err());
+        assert!(c(0.0, 0.0, 96.0).check().is_err());
+        assert!(c(0.0, 0.0, 0.5).check().is_err());
     }
 
     #[test]
@@ -561,5 +645,17 @@ mod tests {
         let out = testing::run::<Retention>([HostMessage::Hello(hello)]);
         assert!(!out.ready());
         assert_eq!(out.exit_code, trunk_recorder_plugin::EXIT_CONFIG);
+    }
+
+    #[test]
+    fn a_root_or_missing_folder_is_refused() {
+        for folder in ["/", "", "/no/such/folder/for/retention"] {
+            let dir = testing::temp_dir("retention");
+            let mut hello = testing::hello(&dir, json!({ "maxAgeDays": 1 }));
+            hello.capture_dir = PathBuf::from(folder);
+            let out = testing::run::<Retention>([HostMessage::Hello(hello)]);
+            assert!(!out.ready(), "{folder:?} was accepted");
+            assert_eq!(out.exit_code, trunk_recorder_plugin::EXIT_CONFIG, "{folder:?}");
+        }
     }
 }
