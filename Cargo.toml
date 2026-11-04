@@ -2,7 +2,7 @@
 # Your plugin's id: lowercase letters, digits and dashes. It names the
 # executable, the release files and the plugin's entry in the registry.
 name = "retention"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Deletes the oldest calls from the recordings folder past an age, a size or a share of the disk."
 license = "MIT"

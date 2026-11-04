@@ -29,7 +29,7 @@ disk's size isn't known, and is then skipped.
 
 - A pass runs a minute after recording starts and every ten minutes after, and sooner (at most once a minute) after every thousand calls concluded, so a busy recorder can't outrun it. The plugin runs only
   while the recorder is recording, so nothing is deleted while it is stopped.
-- Only a call's own files go (`.wav`, `.m4a`, `.json`, `.sdr` and `.frames.jsonl`), all of a call's
+- Only a call's own files go (`.wav`, `.m4a`, `.json`, `.sdr`, `.frames.jsonl`, and a transcription plugin's `.transcript.json`), all of a call's
   together, the oldest call first. Other files in the folder are never touched, and neither are
   hidden ones. Folders left empty are removed; the recordings folder itself stays.
 - **What counts as a call:** files named as the recorder names them (`<talkgroup>-<start>_<freq>`),

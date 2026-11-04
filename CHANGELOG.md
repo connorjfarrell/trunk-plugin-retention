@@ -2,6 +2,11 @@
 
 Each version's section is its GitHub release notes.
 
+## [0.1.1] — unreleased
+
+- A transcription plugin's `<call>.transcript.json` goes with its call, and doesn't change how old the call is (a
+  transcript written days later for an old call doesn't keep it). A transcript whose call is already gone is deleted.
+
 ## [0.1.0] — 2026-10-28
 
 - First release: deletes the oldest calls from the recordings folder once it is older than `maxAgeDays`,

@@ -32,7 +32,8 @@ const WAKE_EVERY: u32 = 1000;
 const MIN_GAP: Duration = Duration::from_secs(60);
 const RECENT: Duration = Duration::from_secs(600);
 /// What a call's files end in; the rest of the name is the call's.
-const SUFFIXES: [&str; 5] = [".frames.jsonl", ".wav", ".m4a", ".json", ".sdr"];
+// (`.transcript.json`, a transcription plugin's words for the call, comes before `.json`, which it also ends with.)
+const SUFFIXES: [&str; 6] = [".frames.jsonl", ".transcript.json", ".wav", ".m4a", ".json", ".sdr"];
 /// What the size limit's gigabyte is.
 const GB: f64 = 1e9;
 
@@ -178,7 +179,10 @@ fn walk(dir: &Path, mut f: impl FnMut(Call)) {
                 let t = m.modified().unwrap_or_else(|_| SystemTime::now());
                 let c = by_call.entry(stem.to_string()).or_insert_with(|| Call { files: Vec::new(), newest: SystemTime::UNIX_EPOCH, bytes: 0 });
                 c.files.push((p, m.len()));
-                c.newest = c.newest.max(t);
+                // A transcript can be written long after the call (a backfill): the call's age is its own files'.
+                if !name.ends_with(".transcript.json") {
+                    c.newest = c.newest.max(t);
+                }
                 c.bytes += m.len();
             }
         }
@@ -540,11 +544,28 @@ mod tests {
     }
 
     #[test]
+    fn a_new_transcript_does_not_make_an_old_call_new_and_a_lone_transcript_goes() {
+        let (r, now) = (root("transcripts"), SystemTime::now());
+        let day = r.join("a/2026/01/01");
+        // An old call, transcribed just now: it is as old as its audio.
+        for (name, hours) in [("5-100_851.0.wav", 24 * 60), ("5-100_851.0.json", 24 * 60), ("5-100_851.0.transcript.json", 0)] {
+            write(&day.join(name), 10);
+            set_age(&day.join(name), now, hours);
+        }
+        // A transcript whose call is already gone.
+        write(&day.join("6-100_851.0.transcript.json"), 10);
+        set_age(&day.join("6-100_851.0.transcript.json"), now, 24 * 60);
+        let rep = pass(&r, &limits(30.0, 0), now, false);
+        assert_eq!((rep.calls, rep.files), (2, 4));
+        assert!(!day.exists() || fs::read_dir(&day).unwrap().next().is_none(), "nothing of either is left");
+    }
+
+    #[test]
     fn a_pass_deletes_whole_calls_and_only_calls() {
         let (r, now) = (root("whole"), SystemTime::now());
         let old = r.join("a/2026/01/01");
         let new = r.join("a/2026/10/13");
-        for ext in ["wav", "json", "m4a", "frames.jsonl", "sdr"] {
+        for ext in ["wav", "json", "m4a", "frames.jsonl", "sdr", "transcript.json"] {
             let p = old.join(format!("5-100_851.0.{ext}"));
             write(&p, 10);
             set_age(&p, now, 24 * 60);
@@ -557,7 +578,7 @@ mod tests {
             set_age(&p, now, 2);
         }
         let rep = pass(&r, &limits(30.0, 0), now, false);
-        assert_eq!((rep.calls, rep.files, rep.bytes), (1, 5, 50));
+        assert_eq!((rep.calls, rep.files, rep.bytes), (1, 6, 60));
         assert!(old.join("notes.txt").exists(), "other files stay, and so does their folder");
         assert!(!old.join("5-100_851.0.wav").exists() && !old.join("5-100_851.0.json").exists());
         assert!(new.join("5-200_851.0.wav").exists() && new.join("5-200_851.0.json").exists());
